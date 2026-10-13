@@ -19,7 +19,7 @@ import org.springframework.data.domain.PageRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
-import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.Authentication;
@@ -37,7 +37,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
-import com.tixevents.app.event.BookingNotificationEvent;
+import com.tixevents.app.config.RabbitConfig;
 import com.tixevents.app.util.RandomUtil;
 
 @Service
@@ -51,7 +51,7 @@ public class BookingService {
     private final TransactionRepository transactionRepository;
     private final UserRepository userRepository;
     private final ObjectMapper objectMapper;
-    private final ApplicationEventPublisher eventPublisher;
+    private final RabbitTemplate rabbitTemplate;
 
     @Transactional
     public Booking createBooking(BookingRequest.CreateBookingRequest request, String userEmail) {
@@ -70,7 +70,7 @@ public class BookingService {
 
         Booking booking = new Booking();
         booking.setUser(user);
-        booking.setNoBooking("BKG-" + RandomUtil.generateRandomAlphaNumeric(6).toUpperCase());
+        booking.setNoBooking("ORD-" + RandomUtil.generateRandomAlphaNumeric(6).toUpperCase());
         booking.setDate(LocalDateTime.now());
         booking.setStatus("PENDING");
         booking.setUserName(user.getName());
@@ -154,7 +154,7 @@ public class BookingService {
         String customerName = booking.getUserName() != null ? booking.getUserName() : booking.getUser().getName();
         String customerEmail = booking.getUser().getEmail();
 
-        // 1. Cek jika sudah pernah CONFIRMED (Idempotent response jika pembayaran berhasil)
+      
         if ("CONFIRMED".equals(booking.getStatus())) {
             if (Boolean.TRUE.equals(request.getIsPaid())) {
                 return booking;
@@ -162,55 +162,30 @@ public class BookingService {
             throw new IllegalStateException("Cannot cancel an already confirmed booking: " + request.getNoBooking());
         }
 
-        // 2. Cek jika booking sudah berstatus FAILED atau EXPIRED sebelumnya
+       
         if ("FAILED".equals(booking.getStatus()) || "EXPIRED".equals(booking.getStatus())) {
             throw new IllegalStateException("Booking cannot be paid because status is " + booking.getStatus() + ": " + request.getNoBooking());
         }
 
-        // 3. Validasi batas waktu (jika waktu > 10 menit tapi scheduler job belum sempat jalan)
+        
         if (booking.getExpiresAt() != null && LocalDateTime.now().isAfter(booking.getExpiresAt())) {
             return expireBooking(booking);
         }
 
-        // 4. Jika pembayaran dibatalkan / gagal
         if (!Boolean.TRUE.equals(request.getIsPaid())) {
             booking.setStatus("FAILED");
             bookingDetailRepository.deactivateByBookingId(booking.getId());
             Booking failedBooking = bookingRepository.save(booking);
 
-            // Publish event notifikasi email pembayaran gagal
-            eventPublisher.publishEvent(BookingNotificationEvent.builder()
-                    .email(customerEmail)
-                    .customerName(customerName)
-                    .bookingNo(booking.getNoBooking())
-                    .eventName("Symphony of The Night")
-                    .seats(seatNumbers)
-                    .totalPrice(totalPrice)
-                    .status("FAILED")
-                    .booking(failedBooking)
-                    .transaction(null)
-                    .build());
+            rabbitTemplate.convertAndSend(RabbitConfig.EXCHANGE, "payment.failed",
+                    buildPayload("FAILED", booking.getNoBooking(), customerEmail, customerName,
+                            booking.getEventName(), seatNumbers, totalPrice, null));
 
             return failedBooking;
         }
 
-        // 5. Pembayaran berhasil dan masih dalam batas waktu
         booking.setStatus("CONFIRMED");
         Booking savedBooking = bookingRepository.save(booking);
-
-        BookingOutbox outbox = new BookingOutbox();
-        outbox.setBooking(savedBooking);
-        outbox.setEventType("booking.paid");
-        outbox.setStatus("PENDING");
-        try {
-            Map<String, Object> payloadMap = new HashMap<>();
-            payloadMap.put("bookingId", savedBooking.getId());
-            payloadMap.put("noBooking", savedBooking.getNoBooking());
-            outbox.setPayload(objectMapper.writeValueAsString(payloadMap));
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException("Failed to serialize outbox payload", e);
-        }
-        bookingOutboxRepository.save(outbox);
 
         Transaction transaction = new Transaction();
         transaction.setBooking(savedBooking);
@@ -221,18 +196,9 @@ public class BookingService {
         transaction.setIdempotencyKey(request.getIdempotencyKey());
         Transaction savedTransaction = transactionRepository.save(transaction);
 
-        // Publish event notifikasi email pembayaran berhasil
-        eventPublisher.publishEvent(BookingNotificationEvent.builder()
-                .email(customerEmail)
-                .customerName(customerName)
-                .bookingNo(savedBooking.getNoBooking())
-                .eventName("Symphony of The Night")
-                .seats(seatNumbers)
-                .totalPrice(totalPrice)
-                .status("SUCCESS")
-                .booking(savedBooking)
-                .transaction(savedTransaction)
-                .build());
+        rabbitTemplate.convertAndSend(RabbitConfig.EXCHANGE, "payment.completed",
+                buildPayload("CONFIRMED", savedBooking.getNoBooking(), customerEmail, customerName,
+                        savedBooking.getEventName(), seatNumbers, totalPrice, savedTransaction.getId()));
 
         return savedBooking;
     }
@@ -268,21 +234,30 @@ public class BookingService {
         String customerEmail = booking.getUser() != null ? booking.getUser().getEmail() : null;
 
         if (customerEmail != null) {
-            eventPublisher.publishEvent(BookingNotificationEvent.builder()
-                    .email(customerEmail)
-                    .customerName(customerName)
-                    .bookingNo(booking.getNoBooking())
-                    .eventName("Symphony of The Night")
-                    .seats(seatNumbers)
-                    .totalPrice(totalPrice)
-                    .status("EXPIRED")
-                    .booking(expiredBooking)
-                    .transaction(null)
-                    .build());
+            rabbitTemplate.convertAndSend(RabbitConfig.EXCHANGE, "payment.failed",
+                    buildPayload("EXPIRED", booking.getNoBooking(), customerEmail, customerName,
+                            booking.getEventName(), seatNumbers, totalPrice, null));
         }
 
         log.info("Booking {} successfully marked as EXPIRED and seats released", booking.getNoBooking());
         return expiredBooking;
+    }
+
+    private Map<String, Object> buildPayload(String status, String noBooking, String customerEmail,
+                                              String customerName, String eventName,
+                                              String seats, BigDecimal totalPrice, Long transactionId) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("status", status);
+        payload.put("noBooking", noBooking);
+        payload.put("customerEmail", customerEmail);
+        payload.put("customerName", customerName);
+        payload.put("eventName", eventName);
+        payload.put("seats", seats);
+        payload.put("totalPrice", totalPrice);
+        if (transactionId != null) {
+            payload.put("transactionId", transactionId);
+        }
+        return payload;
     }
 
     @Transactional

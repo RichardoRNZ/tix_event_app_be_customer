@@ -7,6 +7,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.math.BigDecimal;
@@ -14,6 +15,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -24,20 +26,19 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
-import org.springframework.security.core.Authentication;
 import org.springframework.web.server.ResponseStatusException;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tixevents.app.config.RabbitConfig;
 import com.tixevents.app.dto.BookingRequest;
 import com.tixevents.app.entity.Booking;
 import com.tixevents.app.entity.BookingDetail;
 import com.tixevents.app.entity.BookingOutbox;
 import com.tixevents.app.entity.Transaction;
 import com.tixevents.app.entity.User;
-import com.tixevents.app.event.BookingNotificationEvent;
 import com.tixevents.app.exception.SeatAlreadyBookedException;
 import com.tixevents.app.repository.BookingDetailRepository;
 import com.tixevents.app.repository.BookingOutboxRepository;
@@ -54,9 +55,9 @@ class BookingServiceTest {
     @Mock private BookingOutboxRepository bookingOutboxRepository;
     @Mock private TransactionRepository transactionRepository;
     @Mock private UserRepository userRepository;
-    @Mock private ApplicationEventPublisher eventPublisher;
+    @Mock private RabbitTemplate rabbitTemplate;
 
-    private ObjectMapper objectMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper = new ObjectMapper();
     private BookingService bookingService;
 
     @BeforeEach
@@ -68,7 +69,7 @@ class BookingServiceTest {
                 transactionRepository,
                 userRepository,
                 objectMapper,
-                eventPublisher
+                rabbitTemplate
         );
     }
 
@@ -100,6 +101,10 @@ class BookingServiceTest {
         return booking;
     }
 
+    // -------------------------------------------------------------------------
+    // createBooking
+    // -------------------------------------------------------------------------
+
     @Nested
     @DisplayName("createBooking")
     class CreateBookingTests {
@@ -127,7 +132,7 @@ class BookingServiceTest {
             when(bookingRepository.findByIdempotencyKey("idem-key-2")).thenReturn(Optional.empty());
             when(userRepository.findByEmail("unknown@example.com")).thenReturn(Optional.empty());
 
-            assertThrows(IllegalArgumentException.class, () -> 
+            assertThrows(IllegalArgumentException.class, () ->
                 bookingService.createBooking(req, "unknown@example.com")
             );
         }
@@ -180,6 +185,10 @@ class BookingServiceTest {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // handlePayment
+    // -------------------------------------------------------------------------
+
     @Nested
     @DisplayName("handlePayment")
     class HandlePaymentTests {
@@ -191,7 +200,8 @@ class BookingServiceTest {
             req.setNoBooking("BKG-NONEXIST");
             when(bookingRepository.findByNoBookingWithLock("BKG-NONEXIST")).thenReturn(Optional.empty());
 
-            ResponseStatusException ex = assertThrows(ResponseStatusException.class, () -> bookingService.handlePayment(req, null));
+            ResponseStatusException ex = assertThrows(ResponseStatusException.class,
+                    () -> bookingService.handlePayment(req, null));
             assertEquals(HttpStatus.NOT_FOUND, ex.getStatusCode());
         }
 
@@ -237,7 +247,7 @@ class BookingServiceTest {
         }
 
         @Test
-        @DisplayName("Expires booking if expiresAt has passed when paying")
+        @DisplayName("Expires booking if expiresAt has passed; publishes payment.failed to RabbitMQ")
         void testPaymentExpiredTriggersExpireBooking() {
             BookingRequest.PaymentRequest req = new BookingRequest.PaymentRequest();
             req.setNoBooking("BKG-123456");
@@ -251,11 +261,11 @@ class BookingServiceTest {
 
             assertEquals("EXPIRED", result.getStatus());
             verify(bookingDetailRepository).deactivateByBookingId(expired.getId());
-            verify(eventPublisher).publishEvent(any(BookingNotificationEvent.class));
+            verify(rabbitTemplate).convertAndSend(eq(RabbitConfig.EXCHANGE), eq("payment.failed"), any(Map.class));
         }
 
         @Test
-        @DisplayName("Payment failed / cancelled: sets FAILED and deactivates seats")
+        @DisplayName("Payment failed / cancelled: sets FAILED, deactivates seats, publishes payment.failed")
         void testPaymentCancelled() {
             BookingRequest.PaymentRequest req = new BookingRequest.PaymentRequest();
             req.setNoBooking("BKG-123456");
@@ -270,12 +280,12 @@ class BookingServiceTest {
 
             assertEquals("FAILED", result.getStatus());
             verify(bookingDetailRepository).deactivateByBookingId(pending.getId());
-            verify(eventPublisher).publishEvent(any(BookingNotificationEvent.class));
+            verify(rabbitTemplate).convertAndSend(eq(RabbitConfig.EXCHANGE), eq("payment.failed"), any(Map.class));
             verify(transactionRepository, never()).save(any());
         }
 
         @Test
-        @DisplayName("Payment success: sets CONFIRMED, creates outbox and transaction")
+        @DisplayName("Payment success: sets CONFIRMED, saves transaction, publishes payment.completed")
         void testPaymentSuccess() {
             BookingRequest.PaymentRequest req = new BookingRequest.PaymentRequest();
             req.setNoBooking("BKG-123456");
@@ -287,20 +297,25 @@ class BookingServiceTest {
             Booking pending = sampleBooking("PENDING", LocalDateTime.now().plusMinutes(5));
             when(bookingRepository.findByNoBookingWithLock("BKG-123456")).thenReturn(Optional.of(pending));
             when(bookingRepository.save(any(Booking.class))).thenAnswer(i -> i.getArgument(0));
-            when(transactionRepository.save(any(Transaction.class))).thenAnswer(i -> i.getArgument(0));
+            when(transactionRepository.save(any(Transaction.class))).thenAnswer(i -> {
+                Transaction tx = i.getArgument(0);
+                tx.setId(99L);
+                return tx;
+            });
 
             Booking result = bookingService.handlePayment(req, null);
 
             assertEquals("CONFIRMED", result.getStatus());
-            verify(bookingOutboxRepository).save(any(BookingOutbox.class));
             verify(transactionRepository).save(any(Transaction.class));
-
-            ArgumentCaptor<BookingNotificationEvent> captor = ArgumentCaptor.forClass(BookingNotificationEvent.class);
-            verify(eventPublisher).publishEvent(captor.capture());
-            assertEquals("SUCCESS", captor.getValue().getStatus());
-            assertEquals("john@example.com", captor.getValue().getEmail());
+            verify(rabbitTemplate).convertAndSend(eq(RabbitConfig.EXCHANGE), eq("payment.completed"), any(Map.class));
+            // outbox record is NOT saved in handlePayment after switching to direct RabbitMQ publish
+            verify(bookingOutboxRepository, never()).save(any(BookingOutbox.class));
         }
     }
+
+    // -------------------------------------------------------------------------
+    // expireBooking and processExpiredBookings
+    // -------------------------------------------------------------------------
 
     @Nested
     @DisplayName("expireBooking and processExpiredBookings")
@@ -316,6 +331,7 @@ class BookingServiceTest {
 
             assertEquals("CONFIRMED", result.getStatus());
             verify(bookingDetailRepository, never()).deactivateByBookingId(any());
+            verifyNoInteractions(rabbitTemplate);
         }
 
         @Test
@@ -336,6 +352,134 @@ class BookingServiceTest {
             assertEquals(2, count);
             assertEquals("EXPIRED", b1.getStatus());
             assertEquals("EXPIRED", b2.getStatus());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // RabbitMQ publishing — routing keys and payload content
+    // -------------------------------------------------------------------------
+
+    @Nested
+    @DisplayName("RabbitMQ publishing")
+    class RabbitMQPublishingTests {
+
+        @Test
+        @DisplayName("Payment success: publishes to payment.completed with status CONFIRMED and transactionId in payload")
+        @SuppressWarnings("unchecked")
+        void testPaymentSuccessPayload() {
+            BookingRequest.PaymentRequest req = new BookingRequest.PaymentRequest();
+            req.setNoBooking("BKG-123456");
+            req.setIsPaid(true);
+            req.setPaymentMethod("BCA_VA");
+            req.setIdempotencyKey("idem-tx-1");
+            req.setTotalPrice(BigDecimal.valueOf(500000));
+
+            Booking pending = sampleBooking("PENDING", LocalDateTime.now().plusMinutes(5));
+            when(bookingRepository.findByNoBookingWithLock("BKG-123456")).thenReturn(Optional.of(pending));
+            when(bookingRepository.save(any(Booking.class))).thenAnswer(i -> i.getArgument(0));
+            when(transactionRepository.save(any(Transaction.class))).thenAnswer(i -> {
+                Transaction tx = i.getArgument(0);
+                tx.setId(99L);
+                return tx;
+            });
+
+            bookingService.handlePayment(req, null);
+
+            ArgumentCaptor<Map> payloadCaptor = ArgumentCaptor.forClass(Map.class);
+            verify(rabbitTemplate).convertAndSend(
+                    eq(RabbitConfig.EXCHANGE), eq("payment.completed"), payloadCaptor.capture());
+
+            Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
+            assertEquals("CONFIRMED", payload.get("status"));
+            assertEquals("john@example.com", payload.get("customerEmail"));
+            assertEquals("BKG-123456", payload.get("noBooking"));
+            assertEquals(99L, payload.get("transactionId"));
+        }
+
+        @Test
+        @DisplayName("Payment failed: publishes to payment.failed with status FAILED and no transactionId")
+        @SuppressWarnings("unchecked")
+        void testPaymentFailedPayload() {
+            BookingRequest.PaymentRequest req = new BookingRequest.PaymentRequest();
+            req.setNoBooking("BKG-123456");
+            req.setIsPaid(false);
+            req.setTotalPrice(BigDecimal.valueOf(500000));
+
+            Booking pending = sampleBooking("PENDING", LocalDateTime.now().plusMinutes(5));
+            when(bookingRepository.findByNoBookingWithLock("BKG-123456")).thenReturn(Optional.of(pending));
+            when(bookingRepository.save(any(Booking.class))).thenAnswer(i -> i.getArgument(0));
+
+            bookingService.handlePayment(req, null);
+
+            ArgumentCaptor<Map> payloadCaptor = ArgumentCaptor.forClass(Map.class);
+            verify(rabbitTemplate).convertAndSend(
+                    eq(RabbitConfig.EXCHANGE), eq("payment.failed"), payloadCaptor.capture());
+
+            Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
+            assertEquals("FAILED", payload.get("status"));
+            assertEquals("john@example.com", payload.get("customerEmail"));
+            assertEquals("BKG-123456", payload.get("noBooking"));
+            assertNotNull(payload.get("totalPrice"));
+            assertEquals(false, payload.containsKey("transactionId"));
+        }
+
+        @Test
+        @DisplayName("Expired booking: publishes to payment.failed with status EXPIRED")
+        @SuppressWarnings("unchecked")
+        void testExpireBookingPayload() {
+            Booking pending = sampleBooking("PENDING", LocalDateTime.now().minusMinutes(5));
+            when(bookingRepository.findByNoBookingWithLock("BKG-123456")).thenReturn(Optional.of(pending));
+            when(bookingRepository.save(any(Booking.class))).thenAnswer(i -> i.getArgument(0));
+
+            bookingService.expireBooking(pending);
+
+            ArgumentCaptor<Map> payloadCaptor = ArgumentCaptor.forClass(Map.class);
+            verify(rabbitTemplate).convertAndSend(
+                    eq(RabbitConfig.EXCHANGE), eq("payment.failed"), payloadCaptor.capture());
+
+            Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
+            assertEquals("EXPIRED", payload.get("status"));
+            assertEquals("john@example.com", payload.get("customerEmail"));
+            assertEquals("BKG-123456", payload.get("noBooking"));
+        }
+
+        @Test
+        @DisplayName("Expired booking with null email: does NOT publish to RabbitMQ")
+        void testExpireBookingNullEmailSkipsPublish() {
+            Booking pending = sampleBooking("PENDING", LocalDateTime.now().minusMinutes(5));
+            pending.setUser(null);
+            when(bookingRepository.findByNoBookingWithLock("BKG-123456")).thenReturn(Optional.of(pending));
+            when(bookingRepository.save(any(Booking.class))).thenAnswer(i -> i.getArgument(0));
+
+            bookingService.expireBooking(pending);
+
+            verifyNoInteractions(rabbitTemplate);
+        }
+
+        @Test
+        @DisplayName("Payment success payload contains correct eventName and seats")
+        @SuppressWarnings("unchecked")
+        void testPaymentSuccessPayloadEventNameAndSeats() {
+            BookingRequest.PaymentRequest req = new BookingRequest.PaymentRequest();
+            req.setNoBooking("BKG-123456");
+            req.setIsPaid(true);
+            req.setTotalPrice(BigDecimal.valueOf(500000));
+
+            Booking pending = sampleBooking("PENDING", LocalDateTime.now().plusMinutes(5));
+            when(bookingRepository.findByNoBookingWithLock("BKG-123456")).thenReturn(Optional.of(pending));
+            when(bookingRepository.save(any(Booking.class))).thenAnswer(i -> i.getArgument(0));
+            when(transactionRepository.save(any(Transaction.class))).thenAnswer(i -> i.getArgument(0));
+
+            bookingService.handlePayment(req, null);
+
+            ArgumentCaptor<Map> payloadCaptor = ArgumentCaptor.forClass(Map.class);
+            verify(rabbitTemplate).convertAndSend(
+                    eq(RabbitConfig.EXCHANGE), eq("payment.completed"), payloadCaptor.capture());
+
+            Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
+            assertEquals("Symphony of The Night", payload.get("eventName"));
+            assertNotNull(payload.get("seats"));
+            assertEquals("John Doe", payload.get("customerName"));
         }
     }
 }
